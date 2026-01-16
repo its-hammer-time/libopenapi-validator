@@ -21,6 +21,7 @@ import (
 	"github.com/pb33f/libopenapi-validator/helpers"
 	"github.com/pb33f/libopenapi-validator/parameters"
 	"github.com/pb33f/libopenapi-validator/paths"
+	"github.com/pb33f/libopenapi-validator/radix"
 	"github.com/pb33f/libopenapi-validator/requests"
 	"github.com/pb33f/libopenapi-validator/responses"
 	"github.com/pb33f/libopenapi-validator/schema_validation"
@@ -102,6 +103,11 @@ func NewValidatorFromV3Model(m *v3.Document, opts ...config.Option) Validator {
 	// (warmSchemaCaches checks for nil cache and skips if disabled)
 	warmSchemaCaches(m, options)
 
+	// Build radix tree for O(k) path lookup (where k = path depth)
+	if options.PathLookup == nil {
+		options.PathLookup = radix.BuildPathTree(m)
+	}
+
 	return v
 }
 
@@ -148,7 +154,7 @@ func (v *validator) ValidateHttpResponse(
 	var pathValue string
 	var errs []*errors.ValidationError
 
-	pathItem, errs, pathValue = paths.FindPath(request, v.v3Model, v.options.RegexCache)
+	pathItem, errs, pathValue = paths.FindPath(request, v.v3Model, v.options)
 	if pathItem == nil || errs != nil {
 		return false, errs
 	}
@@ -172,7 +178,7 @@ func (v *validator) ValidateHttpRequestResponse(
 	var pathValue string
 	var errs []*errors.ValidationError
 
-	pathItem, errs, pathValue = paths.FindPath(request, v.v3Model, v.options.RegexCache)
+	pathItem, errs, pathValue = paths.FindPath(request, v.v3Model, v.options)
 	if pathItem == nil || errs != nil {
 		return false, errs
 	}
@@ -190,7 +196,7 @@ func (v *validator) ValidateHttpRequestResponse(
 }
 
 func (v *validator) ValidateHttpRequest(request *http.Request) (bool, []*errors.ValidationError) {
-	pathItem, errs, foundPath := paths.FindPath(request, v.v3Model, v.options.RegexCache)
+	pathItem, errs, foundPath := paths.FindPath(request, v.v3Model, v.options)
 	if len(errs) > 0 {
 		return false, errs
 	}
@@ -301,7 +307,7 @@ func (v *validator) ValidateHttpRequestWithPathItem(request *http.Request, pathI
 }
 
 func (v *validator) ValidateHttpRequestSync(request *http.Request) (bool, []*errors.ValidationError) {
-	pathItem, errs, foundPath := paths.FindPath(request, v.v3Model, v.options.RegexCache)
+	pathItem, errs, foundPath := paths.FindPath(request, v.v3Model, v.options)
 	if len(errs) > 0 {
 		return false, errs
 	}
