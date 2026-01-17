@@ -12,6 +12,7 @@ import (
 	"github.com/pb33f/libopenapi"
 	"github.com/pb33f/libopenapi/datamodel/high/base"
 	"github.com/pb33f/libopenapi/utils"
+	"go.yaml.in/yaml/v4"
 
 	v3 "github.com/pb33f/libopenapi/datamodel/high/v3"
 
@@ -497,12 +498,17 @@ func warmMediaTypeSchema(mediaType *v3.MediaType, schemaCache cache.SchemaCache,
 				if len(renderedInline) > 0 {
 					compiledSchema, _ := helpers.NewCompiledSchema(fmt.Sprintf("%x", hash), renderedJSON, options)
 
+					// Pre-parse YAML node for error reporting (avoids re-parsing on each error)
+					var renderedNode yaml.Node
+					_ = yaml.Unmarshal(renderedInline, &renderedNode)
+
 					schemaCache.Store(hash, &cache.SchemaCacheEntry{
 						Schema:          schema,
 						RenderedInline:  renderedInline,
 						ReferenceSchema: referenceSchema,
 						RenderedJSON:    renderedJSON,
 						CompiledSchema:  compiledSchema,
+						RenderedNode:    &renderedNode,
 					})
 				}
 			}
@@ -545,6 +551,10 @@ func warmParameterSchema(param *v3.Parameter, schemaCache cache.SchemaCache, opt
 				if len(renderedInline) > 0 {
 					compiledSchema, _ := helpers.NewCompiledSchema(fmt.Sprintf("%x", hash), renderedJSON, options)
 
+					// Pre-parse YAML node for error reporting (avoids re-parsing on each error)
+					var renderedNode yaml.Node
+					_ = yaml.Unmarshal(renderedInline, &renderedNode)
+
 					// Store in cache using the shared SchemaCache type
 					schemaCache.Store(hash, &cache.SchemaCacheEntry{
 						Schema:          schema,
@@ -552,6 +562,7 @@ func warmParameterSchema(param *v3.Parameter, schemaCache cache.SchemaCache, opt
 						ReferenceSchema: referenceSchema,
 						RenderedJSON:    renderedJSON,
 						CompiledSchema:  compiledSchema,
+						RenderedNode:    &renderedNode,
 					})
 				}
 			}
