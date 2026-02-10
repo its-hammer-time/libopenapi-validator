@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/pb33f/libopenapi"
@@ -21,7 +22,7 @@ import (
 	"github.com/pb33f/libopenapi-validator/errors"
 	"github.com/pb33f/libopenapi-validator/helpers"
 	"github.com/pb33f/libopenapi-validator/parameters"
-	"github.com/pb33f/libopenapi-validator/paths"
+	"github.com/pb33f/libopenapi-validator/radix"
 	"github.com/pb33f/libopenapi-validator/requests"
 	"github.com/pb33f/libopenapi-validator/responses"
 	"github.com/pb33f/libopenapi-validator/schema_validation"
@@ -88,7 +89,32 @@ func NewValidator(document libopenapi.Document, opts ...config.Option) (Validato
 func NewValidatorFromV3Model(m *v3.Document, opts ...config.Option) Validator {
 	options := config.NewValidationOptions(opts...)
 
-	v := &validator{options: options, v3Model: m}
+	// Build radix tree for O(k) path lookup (where k = path depth)
+	// Skip if explicitly set via WithPathTree (including nil to disable)
+	if options.PathTree == nil && !options.IsPathTreeSet() {
+		options.PathTree = radix.BuildPathTree(m)
+	}
+
+	// warm the schema caches by pre-compiling all schemas in the document
+	// (warmSchemaCaches checks for nil cache and skips if disabled)
+	warmSchemaCaches(m, options)
+
+	// warm the regex cache by pre-compiling all path parameter regexes
+	warmRegexCache(m, options)
+
+	// Build the matcher chain: radix first (fast), regex fallback (handles complex patterns)
+	var matchers matcherChain
+	if options.PathTree != nil {
+		matchers = append(matchers, &radixMatcher{pathLookup: options.PathTree})
+	}
+	matchers = append(matchers, &regexMatcher{regexCache: options.RegexCache})
+
+	v := &validator{
+		options:  options,
+		v3Model:  m,
+		matchers: matchers,
+		version:  helpers.VersionToFloat(m.Version),
+	}
 
 	// create a new parameter validator
 	v.paramValidator = parameters.NewParameterValidator(m, config.WithExistingOpts(options))
@@ -98,10 +124,6 @@ func NewValidatorFromV3Model(m *v3.Document, opts ...config.Option) Validator {
 
 	// create a response body validator
 	v.responseValidator = responses.NewResponseBodyValidator(m, config.WithExistingOpts(options))
-
-	// warm the schema caches by pre-compiling all schemas in the document
-	// (warmSchemaCaches checks for nil cache and skips if disabled)
-	warmSchemaCaches(m, options)
 
 	return v
 }
@@ -145,20 +167,12 @@ func (v *validator) ValidateHttpResponse(
 	request *http.Request,
 	response *http.Response,
 ) (bool, []*errors.ValidationError) {
-	var pathItem *v3.PathItem
-	var pathValue string
-	var errs []*errors.ValidationError
-
-	pathItem, errs, pathValue = paths.FindPath(request, v.v3Model, v.options.RegexCache)
-	if pathItem == nil || errs != nil {
+	ctx, errs := v.buildRequestContext(request)
+	if errs != nil {
 		return false, errs
 	}
-
-	responseBodyValidator := v.responseValidator
-
-	// validate response
-	_, responseErrors := responseBodyValidator.ValidateResponseBodyWithPathItem(request, response, pathItem, pathValue)
-
+	_, responseErrors := v.responseValidator.ValidateResponseBodyWithPathItem(
+		request, response, ctx.route.pathItem, ctx.route.matchedPath)
 	if len(responseErrors) > 0 {
 		return false, responseErrors
 	}
@@ -169,21 +183,13 @@ func (v *validator) ValidateHttpRequestResponse(
 	request *http.Request,
 	response *http.Response,
 ) (bool, []*errors.ValidationError) {
-	var pathItem *v3.PathItem
-	var pathValue string
-	var errs []*errors.ValidationError
-
-	pathItem, errs, pathValue = paths.FindPath(request, v.v3Model, v.options.RegexCache)
-	if pathItem == nil || errs != nil {
+	ctx, errs := v.buildRequestContext(request)
+	if errs != nil {
 		return false, errs
 	}
-
-	responseBodyValidator := v.responseValidator
-
-	// validate request and response
-	_, requestErrors := v.ValidateHttpRequestWithPathItem(request, pathItem, pathValue)
-	_, responseErrors := responseBodyValidator.ValidateResponseBodyWithPathItem(request, response, pathItem, pathValue)
-
+	_, requestErrors := v.ValidateHttpRequestWithPathItem(request, ctx.route.pathItem, ctx.route.matchedPath)
+	_, responseErrors := v.responseValidator.ValidateResponseBodyWithPathItem(
+		request, response, ctx.route.pathItem, ctx.route.matchedPath)
 	if len(requestErrors) > 0 || len(responseErrors) > 0 {
 		return false, append(requestErrors, responseErrors...)
 	}
@@ -191,154 +197,125 @@ func (v *validator) ValidateHttpRequestResponse(
 }
 
 func (v *validator) ValidateHttpRequest(request *http.Request) (bool, []*errors.ValidationError) {
-	pathItem, errs, foundPath := paths.FindPath(request, v.v3Model, v.options.RegexCache)
-	if len(errs) > 0 {
+	// Fast path: use synchronous validation for requests without a body
+	// to avoid unnecessary goroutine overhead.
+	if request.Body == nil || request.ContentLength == 0 {
+		return v.ValidateHttpRequestSync(request)
+	}
+
+	ctx, errs := v.buildRequestContext(request)
+	if errs != nil {
 		return false, errs
 	}
-	return v.ValidateHttpRequestWithPathItem(request, pathItem, foundPath)
+	return v.validateWithContext(ctx)
 }
 
 func (v *validator) ValidateHttpRequestWithPathItem(request *http.Request, pathItem *v3.PathItem, pathValue string) (bool, []*errors.ValidationError) {
-	// create a new parameter validator
-	paramValidator := v.paramValidator
-
-	// create a new request body validator
-	reqBodyValidator := v.requestValidator
-
-	// create some channels to handle async validation
-	doneChan := make(chan struct{})
-	errChan := make(chan []*errors.ValidationError)
-	controlChan := make(chan struct{})
-
-	// async param validation function.
-	parameterValidationFunc := func(control chan struct{}, errorChan chan []*errors.ValidationError) {
-		paramErrs := make(chan []*errors.ValidationError)
-		paramControlChan := make(chan struct{})
-		paramFunctionControlChan := make(chan struct{})
-		var paramValidationErrors []*errors.ValidationError
-
-		validations := []validationFunction{
-			paramValidator.ValidatePathParamsWithPathItem,
-			paramValidator.ValidateCookieParamsWithPathItem,
-			paramValidator.ValidateHeaderParamsWithPathItem,
-			paramValidator.ValidateQueryParamsWithPathItem,
-			paramValidator.ValidateSecurityWithPathItem,
-		}
-
-		// listen for validation errors on parameters. everything will run async.
-		paramListener := func(control chan struct{}, errorChan chan []*errors.ValidationError) {
-			completedValidations := 0
-			for {
-				select {
-				case vErrs := <-errorChan:
-					paramValidationErrors = append(paramValidationErrors, vErrs...)
-				case <-control:
-					completedValidations++
-					if completedValidations == len(validations) {
-						paramFunctionControlChan <- struct{}{}
-						return
-					}
-				}
-			}
-		}
-
-		validateParamFunction := func(
-			control chan struct{},
-			errorChan chan []*errors.ValidationError,
-			validatorFunc validationFunction,
-		) {
-			valid, pErrs := validatorFunc(request, pathItem, pathValue)
-			if !valid {
-				errorChan <- pErrs
-			}
-			control <- struct{}{}
-		}
-		go paramListener(paramControlChan, paramErrs)
-		for i := range validations {
-			go validateParamFunction(paramControlChan, paramErrs, validations[i])
-		}
-
-		// wait for all the validations to complete
-		<-paramFunctionControlChan
-		if len(paramValidationErrors) > 0 {
-			errorChan <- paramValidationErrors
-		}
-
-		// let runValidation know we are done with this part.
-		controlChan <- struct{}{}
+	ctx := &requestContext{
+		request: request,
+		route: &resolvedRoute{
+			pathItem:    pathItem,
+			matchedPath: pathValue,
+		},
+		operation: helpers.OperationForMethod(request.Method, pathItem),
+		version:   v.version,
 	}
+	return v.validateWithContext(ctx)
+}
 
-	requestBodyValidationFunc := func(control chan struct{}, errorChan chan []*errors.ValidationError) {
-		valid, pErrs := reqBodyValidator.ValidateRequestBodyWithPathItem(request, pathItem, pathValue)
-		if !valid {
-			errorChan <- pErrs
-		}
-		control <- struct{}{}
-	}
+func (v *validator) validatePathParamsCtx(ctx *requestContext) (bool, []*errors.ValidationError) {
+	return v.paramValidator.ValidatePathParamsWithPathItem(ctx.request, ctx.route.pathItem, ctx.route.matchedPath)
+}
 
-	// build async functions
-	asyncFunctions := []validationFunctionAsync{
-		parameterValidationFunc,
-		requestBodyValidationFunc,
-	}
+func (v *validator) validateQueryParamsCtx(ctx *requestContext) (bool, []*errors.ValidationError) {
+	return v.paramValidator.ValidateQueryParamsWithPathItem(ctx.request, ctx.route.pathItem, ctx.route.matchedPath)
+}
 
+func (v *validator) validateHeaderParamsCtx(ctx *requestContext) (bool, []*errors.ValidationError) {
+	return v.paramValidator.ValidateHeaderParamsWithPathItem(ctx.request, ctx.route.pathItem, ctx.route.matchedPath)
+}
+
+func (v *validator) validateCookieParamsCtx(ctx *requestContext) (bool, []*errors.ValidationError) {
+	return v.paramValidator.ValidateCookieParamsWithPathItem(ctx.request, ctx.route.pathItem, ctx.route.matchedPath)
+}
+
+func (v *validator) validateSecurityCtx(ctx *requestContext) (bool, []*errors.ValidationError) {
+	return v.paramValidator.ValidateSecurityWithPathItem(ctx.request, ctx.route.pathItem, ctx.route.matchedPath)
+}
+
+func (v *validator) validateRequestBodyCtx(ctx *requestContext) (bool, []*errors.ValidationError) {
+	return v.requestValidator.ValidateRequestBodyWithPathItem(ctx.request, ctx.route.pathItem, ctx.route.matchedPath)
+}
+
+// validateRequestSync runs all validation functions sequentially using the request context.
+func (v *validator) validateRequestSync(ctx *requestContext) (bool, []*errors.ValidationError) {
 	var validationErrors []*errors.ValidationError
+	for _, validateFunc := range []validationFunction{
+		v.validatePathParamsCtx,
+		v.validateCookieParamsCtx,
+		v.validateHeaderParamsCtx,
+		v.validateQueryParamsCtx,
+		v.validateSecurityCtx,
+		v.validateRequestBodyCtx,
+	} {
+		if valid, pErrs := validateFunc(ctx); !valid {
+			validationErrors = append(validationErrors, pErrs...)
+		}
+	}
+	return len(validationErrors) == 0, validationErrors
+}
 
-	// sit and wait for everything to report back.
-	go runValidation(controlChan, doneChan, errChan, &validationErrors, len(asyncFunctions))
+// validateWithContext runs all validation functions concurrently using a WaitGroup.
+// This replaces the previous 9-goroutine/5-channel choreography with a simpler pattern.
+func (v *validator) validateWithContext(ctx *requestContext) (bool, []*errors.ValidationError) {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var allErrors []*errors.ValidationError
 
-	// run async functions
-	for i := range asyncFunctions {
-		go asyncFunctions[i](controlChan, errChan)
+	validators := []validationFunction{
+		v.validatePathParamsCtx,
+		v.validateCookieParamsCtx,
+		v.validateHeaderParamsCtx,
+		v.validateQueryParamsCtx,
+		v.validateSecurityCtx,
+		v.validateRequestBodyCtx,
 	}
 
-	// wait for all the validations to complete
-	<-doneChan
-
-	// sort errors for deterministic ordering (async validation can return errors in any order)
-	sortValidationErrors(validationErrors)
-
-	return len(validationErrors) == 0, validationErrors
+	wg.Add(len(validators))
+	for _, fn := range validators {
+		go func(validate validationFunction) {
+			defer wg.Done()
+			if valid, errs := validate(ctx); !valid {
+				mu.Lock()
+				allErrors = append(allErrors, errs...)
+				mu.Unlock()
+			}
+		}(fn)
+	}
+	wg.Wait()
+	sortValidationErrors(allErrors)
+	return len(allErrors) == 0, allErrors
 }
 
 func (v *validator) ValidateHttpRequestSync(request *http.Request) (bool, []*errors.ValidationError) {
-	pathItem, errs, foundPath := paths.FindPath(request, v.v3Model, v.options.RegexCache)
-	if len(errs) > 0 {
+	ctx, errs := v.buildRequestContext(request)
+	if errs != nil {
 		return false, errs
 	}
-	return v.ValidateHttpRequestSyncWithPathItem(request, pathItem, foundPath)
+	return v.validateRequestSync(ctx)
 }
 
 func (v *validator) ValidateHttpRequestSyncWithPathItem(request *http.Request, pathItem *v3.PathItem, pathValue string) (bool, []*errors.ValidationError) {
-	// create a new parameter validator
-	paramValidator := v.paramValidator
-
-	// create a new request body validator
-	reqBodyValidator := v.requestValidator
-
-	validationErrors := make([]*errors.ValidationError, 0)
-
-	paramValidationErrors := make([]*errors.ValidationError, 0)
-	for _, validateFunc := range []validationFunction{
-		paramValidator.ValidatePathParamsWithPathItem,
-		paramValidator.ValidateCookieParamsWithPathItem,
-		paramValidator.ValidateHeaderParamsWithPathItem,
-		paramValidator.ValidateQueryParamsWithPathItem,
-		paramValidator.ValidateSecurityWithPathItem,
-	} {
-		valid, pErrs := validateFunc(request, pathItem, pathValue)
-		if !valid {
-			paramValidationErrors = append(paramValidationErrors, pErrs...)
-		}
+	ctx := &requestContext{
+		request: request,
+		route: &resolvedRoute{
+			pathItem:    pathItem,
+			matchedPath: pathValue,
+		},
+		operation: helpers.OperationForMethod(request.Method, pathItem),
+		version:   v.version,
 	}
-
-	valid, pErrs := reqBodyValidator.ValidateRequestBodyWithPathItem(request, pathItem, pathValue)
-	if !valid {
-		paramValidationErrors = append(paramValidationErrors, pErrs...)
-	}
-
-	validationErrors = append(validationErrors, paramValidationErrors...)
-	return len(validationErrors) == 0, validationErrors
+	return v.validateRequestSync(ctx)
 }
 
 type validator struct {
@@ -348,35 +325,11 @@ type validator struct {
 	paramValidator    parameters.ParameterValidator
 	requestValidator  requests.RequestBodyValidator
 	responseValidator responses.ResponseBodyValidator
+	matchers          matcherChain
+	version           float32 // cached OAS version (3.0 or 3.1)
 }
 
-func runValidation(control, doneChan chan struct{},
-	errorChan chan []*errors.ValidationError,
-	validationErrors *[]*errors.ValidationError,
-	total int,
-) {
-	var validationLock sync.Mutex
-	completedValidations := 0
-	for {
-		select {
-		case vErrs := <-errorChan:
-			validationLock.Lock()
-			*validationErrors = append(*validationErrors, vErrs...)
-			validationLock.Unlock()
-		case <-control:
-			completedValidations++
-			if completedValidations == total {
-				doneChan <- struct{}{}
-				return
-			}
-		}
-	}
-}
-
-type (
-	validationFunction      func(request *http.Request, pathItem *v3.PathItem, pathValue string) (bool, []*errors.ValidationError)
-	validationFunctionAsync func(control chan struct{}, errorChan chan []*errors.ValidationError)
-)
+type validationFunction func(ctx *requestContext) (bool, []*errors.ValidationError)
 
 // sortValidationErrors sorts validation errors for deterministic ordering.
 // Errors are sorted by validation type first, then by message.
@@ -558,6 +511,34 @@ func warmParameterSchema(param *v3.Parameter, schemaCache cache.SchemaCache, opt
 						CompiledSchema:  compiledSchema,
 						RenderedNode:    &renderedNode,
 					})
+				}
+			}
+		}
+	}
+}
+
+// warmRegexCache pre-compiles all path parameter regexes in the OpenAPI document and stores them in the regex cache.
+// This frontloads the compilation cost so that runtime validation doesn't need to compile regexes for path segments.
+func warmRegexCache(doc *v3.Document, options *config.ValidationOptions) {
+	if doc == nil || doc.Paths == nil || doc.Paths.PathItems == nil || options.RegexCache == nil {
+		return
+	}
+
+	for pathPair := doc.Paths.PathItems.First(); pathPair != nil; pathPair = pathPair.Next() {
+		pathKey := pathPair.Key()
+		segments := strings.Split(pathKey, "/")
+		for _, segment := range segments {
+			if segment == "" {
+				continue
+			}
+			// Only compile segments that contain path parameters (have braces)
+			if !strings.Contains(segment, "{") {
+				continue
+			}
+			if _, found := options.RegexCache.Load(segment); !found {
+				r, err := helpers.GetRegexForPath(segment)
+				if err == nil {
+					options.RegexCache.Store(segment, r)
 				}
 			}
 		}

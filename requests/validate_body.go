@@ -10,14 +10,13 @@ import (
 
 	v3 "github.com/pb33f/libopenapi/datamodel/high/v3"
 
-	"github.com/pb33f/libopenapi-validator/config"
 	"github.com/pb33f/libopenapi-validator/errors"
 	"github.com/pb33f/libopenapi-validator/helpers"
 	"github.com/pb33f/libopenapi-validator/paths"
 )
 
 func (v *requestBodyValidator) ValidateRequestBody(request *http.Request) (bool, []*errors.ValidationError) {
-	pathItem, errs, foundPath := paths.FindPath(request, v.document, v.options.RegexCache)
+	pathItem, errs, foundPath := paths.FindPath(request, v.document, v.options)
 	if len(errs) > 0 {
 		return false, errs
 	}
@@ -83,8 +82,8 @@ func (v *requestBodyValidator) ValidateRequestBodyWithPathItem(request *http.Req
 	validationSucceeded, validationErrors := ValidateRequestSchema(&ValidateRequestSchemaInput{
 		Request: request,
 		Schema:  schema,
-		Version: helpers.VersionToFloat(v.document.Version),
-		Options: []config.Option{config.WithExistingOpts(v.options)},
+		Version: v.version,
+		Options: v.options,
 	})
 
 	errors.PopulateValidationErrors(validationErrors, request, pathValue)

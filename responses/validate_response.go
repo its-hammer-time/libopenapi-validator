@@ -32,11 +32,11 @@ var instanceLocationRegex = regexp.MustCompile(`^/(\d+)`)
 
 // ValidateResponseSchemaInput contains parameters for response schema validation.
 type ValidateResponseSchemaInput struct {
-	Request  *http.Request   // Required: The HTTP request (for context)
-	Response *http.Response  // Required: The HTTP response to validate
-	Schema   *base.Schema    // Required: The OpenAPI schema to validate against
-	Version  float32         // Required: OpenAPI version (3.0 or 3.1)
-	Options  []config.Option // Optional: Functional options (defaults applied if empty/nil)
+	Request  *http.Request             // Required: The HTTP request (for context)
+	Response *http.Response            // Required: The HTTP response to validate
+	Schema   *base.Schema              // Required: The OpenAPI schema to validate against
+	Version  float32                   // Required: OpenAPI version (3.0 or 3.1)
+	Options  *config.ValidationOptions // Optional: Validation options (defaults applied if nil)
 }
 
 // ValidateResponseSchema will validate the response body for a http.Response pointer. The request is used to
@@ -46,7 +46,10 @@ type ValidateResponseSchemaInput struct {
 // This function is used by the ValidateResponseBody function, but can be used independently.
 // The schema will be compiled from cache if available, otherwise it will be compiled and cached.
 func ValidateResponseSchema(input *ValidateResponseSchemaInput) (bool, []*errors.ValidationError) {
-	validationOptions := config.NewValidationOptions(input.Options...)
+	validationOptions := input.Options
+	if validationOptions == nil {
+		validationOptions = config.NewValidationOptions()
+	}
 	var validationErrors []*errors.ValidationError
 	var renderedSchema, jsonSchema []byte
 	var referenceSchema string
@@ -69,8 +72,8 @@ func ValidateResponseSchema(input *ValidateResponseSchemaInput) (bool, []*errors
 		}}
 	}
 
+	hash := input.Schema.GoLow().Hash()
 	if validationOptions.SchemaCache != nil {
-		hash := input.Schema.GoLow().Hash()
 		if cached, ok := validationOptions.SchemaCache.Load(hash); ok && cached != nil && cached.CompiledSchema != nil {
 			renderedSchema = cached.RenderedInline
 			referenceSchema = cached.ReferenceSchema
@@ -112,7 +115,7 @@ func ValidateResponseSchema(input *ValidateResponseSchemaInput) (bool, []*errors
 		jsonSchema, _ = utils.ConvertYAMLtoJSON(renderedSchema)
 
 		var err error
-		schemaName := fmt.Sprintf("%x", input.Schema.GoLow().Hash())
+		schemaName := fmt.Sprintf("%x", hash)
 		compiledSchema, err = helpers.NewCompiledSchemaWithVersion(
 			schemaName,
 			jsonSchema,
@@ -142,7 +145,6 @@ func ValidateResponseSchema(input *ValidateResponseSchemaInput) (bool, []*errors
 		}
 
 		if validationOptions.SchemaCache != nil {
-			hash := input.Schema.GoLow().Hash()
 			validationOptions.SchemaCache.Store(hash, &cache.SchemaCacheEntry{
 				Schema:          input.Schema,
 				RenderedInline:  renderedSchema,
@@ -259,7 +261,7 @@ func ValidateResponseSchema(input *ValidateResponseSchemaInput) (bool, []*errors
 			er := schFlatErrs[q]
 
 			errMsg := er.Error.Kind.LocalizedString(message.NewPrinter(language.Tag{}))
-			if er.KeywordLocation == "" || helpers.IgnoreRegex.MatchString(errMsg) {
+			if er.KeywordLocation == "" || helpers.ShouldIgnoreError(errMsg) {
 				continue // ignore this error, it's useless tbh, utter noise.
 			}
 			if er.Error != nil {
@@ -270,27 +272,35 @@ func ValidateResponseSchema(input *ValidateResponseSchemaInput) (bool, []*errors
 				val := instanceLocationRegex.FindStringSubmatch(er.InstanceLocation)
 				var referenceObject string
 
-				if len(val) > 0 {
-					referenceIndex, _ := strconv.Atoi(val[1])
-					if reflect.ValueOf(decodedObj).Type().Kind() == reflect.Slice {
-						found := decodedObj.([]any)[referenceIndex]
-						recoded, _ := json.MarshalIndent(found, "", "  ")
-						referenceObject = string(recoded)
+				if !validationOptions.LazyErrors {
+					if len(val) > 0 {
+						referenceIndex, _ := strconv.Atoi(val[1])
+						if reflect.ValueOf(decodedObj).Type().Kind() == reflect.Slice {
+							found := decodedObj.([]any)[referenceIndex]
+							recoded, _ := json.Marshal(found)
+							referenceObject = string(recoded)
+						}
 					}
-				}
-				if referenceObject == "" {
-					referenceObject = string(responseBody)
+					if referenceObject == "" {
+						referenceObject = string(responseBody)
+					}
 				}
 
 				violation := &errors.SchemaValidationFailure{
-					Reason:          errMsg,
-					Location:        er.KeywordLocation,
-					FieldName:       helpers.ExtractFieldNameFromStringLocation(er.InstanceLocation),
-					FieldPath:       helpers.ExtractJSONPathFromStringLocation(er.InstanceLocation),
-					InstancePath:    helpers.ConvertStringLocationToPathSegments(er.InstanceLocation),
-					ReferenceSchema: referenceSchema,
-					ReferenceObject: referenceObject,
-					OriginalError:   jk,
+					Reason:        errMsg,
+					Location:      er.KeywordLocation,
+					FieldName:     helpers.ExtractFieldNameFromStringLocation(er.InstanceLocation),
+					FieldPath:     helpers.ExtractJSONPathFromStringLocation(er.InstanceLocation),
+					InstancePath:  helpers.ConvertStringLocationToPathSegments(er.InstanceLocation),
+					OriginalError: jk,
+				}
+				if validationOptions.LazyErrors {
+					violation.SetLazySource(renderedSchema, decodedObj, responseBody, er.InstanceLocation)
+				} else {
+					//nolint:staticcheck // Backward compatibility: set deprecated fields directly in eager mode
+					violation.ReferenceSchema = referenceSchema
+					//nolint:staticcheck // Backward compatibility: set deprecated fields directly in eager mode
+					violation.ReferenceObject = referenceObject
 				}
 				// if we have a location within the schema, add it to the error
 				if located != nil {

@@ -9,8 +9,9 @@ import (
 	"strings"
 
 	"github.com/pb33f/libopenapi/datamodel/high/base"
-	v3 "github.com/pb33f/libopenapi/datamodel/high/v3"
 	"github.com/pb33f/libopenapi/orderedmap"
+
+	v3 "github.com/pb33f/libopenapi/datamodel/high/v3"
 
 	"github.com/pb33f/libopenapi-validator/errors"
 	"github.com/pb33f/libopenapi-validator/helpers"
@@ -18,7 +19,7 @@ import (
 )
 
 func (v *paramValidator) ValidateSecurity(request *http.Request) (bool, []*errors.ValidationError) {
-	pathItem, errs, foundPath := paths.FindPath(request, v.document, v.options.RegexCache)
+	pathItem, errs, foundPath := paths.FindPath(request, v.document, v.options)
 	if len(errs) > 0 {
 		return false, errs
 	}

@@ -23,7 +23,7 @@ func (v *responseBodyValidator) ValidateResponseBody(
 	request *http.Request,
 	response *http.Response,
 ) (bool, []*errors.ValidationError) {
-	pathItem, errs, foundPath := paths.FindPath(request, v.document, v.options.RegexCache)
+	pathItem, errs, foundPath := paths.FindPath(request, v.document, v.options)
 	if len(errs) > 0 {
 		return false, errs
 	}
@@ -144,8 +144,8 @@ func (v *responseBodyValidator) checkResponseSchema(
 				Request:  request,
 				Response: response,
 				Schema:   schema,
-				Version:  helpers.VersionToFloat(v.document.Version),
-				Options:  []config.Option{config.WithExistingOpts(v.options)},
+				Version:  v.version,
+				Options:  v.options,
 			})
 			if !valid {
 				validationErrors = append(validationErrors, vErrs...)
